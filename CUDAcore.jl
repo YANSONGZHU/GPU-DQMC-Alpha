@@ -13,14 +13,16 @@ struct lattice
     Nt::Int
     Δτ::Float64
     λ::Float64
-    expmΔτT::CuArray{Float64}
+    Tmatrix::Matrix{Int}
+    expmΔτT::CUDAUDT{Float64}
 
     function lattice(L::Int,U::Float64,μ::Float64,Temp::Float64,Nt::Int)
         Ns = L^3
         Δτ = 1/(Temp*Nt)
         λ = acosh(exp(abs(U)*Δτ/2))
-        expmΔτT = adapt(CuArray,exp(-Δτ * initT(L)))
-        new(L,Ns,U,μ,Temp,Nt,Δτ,λ,expmΔτT)
+        Tmatrix = adapt(CuArray,initT(L))
+        expmΔτT = CUDAudt(exp(-Δτ * initT(L)))
+        new(L,Ns,U,μ,Temp,Nt,Δτ,λ,Tmatrix,expmΔτT)
     end
 end
 
@@ -39,6 +41,11 @@ function initT(L::Int)
     Tmatrix
 end
 
+function CUDAeTeV(eT::CUDAUDT,eV::CuVector{Float64})
+    inveV = 1 ./ eV
+    CUDAUDT(eT.U,eT.D .* eV,Diagonal(inveV) * eT.T * Diagonal(eV))
+end
+
 function initMultBudt(l::lattice,AuxField::Matrix{Int})
     MultBup = Vector{CUDAUDT}(undef,l.Nt+2)
     MultBdn = Vector{CUDAUDT}(undef,l.Nt+2)
@@ -48,10 +55,8 @@ function initMultBudt(l::lattice,AuxField::Matrix{Int})
     MultBup[l.Nt+2] = copy(UDTI)
     MultBdn[l.Nt+2] = copy(UDTI)
     for i = 2:l.Nt+1
-        MultBup[i] = CUDAudtMult(MultBup[i-1],
-            CUDAudt(l.expmΔτT*Diagonal(exp.(cu( AuxField[:,i-1])*l.λ .+ (l.μ - l.U/2)*l.Δτ))))
-        MultBdn[i] = CUDAudtMult(MultBdn[i-1],
-            CUDAudt(l.expmΔτT*Diagonal(exp.(cu(-AuxField[:,i-1])*l.λ .+ (l.μ - l.U/2)*l.Δτ))))
+        MultBup[i] = CUDAudtMult(MultBup[i-1],CUDAeTeV(l.expmΔτT,exp.(cu( AuxField[:,i-1])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
+        MultBdn[i] = CUDAudtMult(MultBdn[i-1],CUDAeTeV(l.expmΔτT,exp.(cu(-AuxField[:,i-1])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
     end
     MultBup, MultBdn
 end
@@ -83,11 +88,11 @@ end
 
 function updateRight!(slice::Int,l::lattice,AuxField::Matrix{Int},
     MultBup::Vector{CUDAUDT},MultBdn::Vector{CUDAUDT},gup::CuArray{Float64},gdn::CuArray{Float64})
-    MultBup[l.Nt-slice+2] = CUDAudtMult(CUDAudt(l.expmΔτT * Diagonal(exp.(cu( AuxField[:,slice])*l.λ 
-        .+ (l.μ - l.U/2)*l.Δτ))), MultBup[l.Nt-slice+3])
+    MultBup[l.Nt-slice+2] = CUDAudtMult(CUDAeTeV(l.expmΔτT,
+        exp.(cu( AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)), MultBup[l.Nt-slice+3])
     gup[:,:] = invoneplus(CUDAudtMult(MultBup[l.Nt-slice+2],MultBup[l.Nt-slice+1]))
-    MultBdn[l.Nt-slice+2] = CUDAudtMult(CUDAudt(l.expmΔτT * Diagonal(exp.(cu(-AuxField[:,slice])*l.λ 
-        .+ (l.μ - l.U/2)*l.Δτ))), MultBdn[l.Nt-slice+3])
+    MultBdn[l.Nt-slice+2] = CUDAudtMult(CUDAeTeV(l.expmΔτT,
+        exp.(cu(-AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)), MultBdn[l.Nt-slice+3])
     gdn[:,:] = invoneplus(CUDAudtMult(MultBdn[l.Nt-slice+2],MultBdn[l.Nt-slice+1]))
     nothing
 end
@@ -95,10 +100,10 @@ end
 function updateLeft!(slice::Int,l::lattice,AuxField::Matrix{Int},
     MultBup::Vector{CUDAUDT},MultBdn::Vector{CUDAUDT},gup::CuArray{Float64},gdn::CuArray{Float64})
     MultBup[l.Nt-slice+2] = CUDAudtMult(MultBup[l.Nt-slice+1],
-        CUDAudt(l.expmΔτT * Diagonal(exp.(cu( AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ))))
+        CUDAeTeV(l.expmΔτT, exp.(cu( AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
     gup[:,:] = invoneplus(CUDAudtMult(MultBup[l.Nt-slice+2],MultBup[l.Nt-slice+3]))
-    MultBdn[l.Nt-slice+2] = CUDAudtMult(MultBdn[l.Nt-slice+1], 
-        CUDAudt(l.expmΔτT * Diagonal(exp.(cu(-AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ))))
+    MultBdn[l.Nt-slice+2] = CUDAudtMult(MultBdn[l.Nt-slice+1],
+        CUDAeTeV(l.expmΔτT, exp.(cu(-AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
     gdn[:,:] = invoneplus(CUDAudtMult(MultBdn[l.Nt-slice+2],MultBdn[l.Nt-slice+3]))
     nothing
 end
